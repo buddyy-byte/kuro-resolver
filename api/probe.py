@@ -7,9 +7,8 @@ Returns status codes, server headers, and small body samples so we can tell:
   - Does Cloudflare return a real page or a bot-check (403 + cf-mitigated)?
   - Does the CDN we care about (echovideo) still return #EXTM3U manifests?
 
-This is diagnostic-only. No TLS impersonation, no masking — we want the
-naive, no-tricks baseline. If a host works here, it works for a real client.
-If it needs chrome131 + residential we'll see 403s and act accordingly.
+All upstreams are probed in parallel with a tight per-request timeout so the
+function finishes inside Vercel's hobby-plan 10s budget.
 """
 from __future__ import annotations
 
@@ -19,6 +18,7 @@ import socket
 import time
 import urllib.request
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler
 
 
@@ -42,13 +42,14 @@ UA = (
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
+PER_REQUEST_TIMEOUT = 5.0
+
 
 def probe_one(label: str, method: str, url: str, extra: dict[str, str]) -> dict:
     host = url.split("/")[2]
     started = time.time()
     result: dict = {"label": label, "url": url, "host": host}
 
-    # DNS first — tells us if the function even has outbound DNS working
     try:
         result["ip"] = socket.gethostbyname(host)
     except Exception as e:
@@ -68,7 +69,7 @@ def probe_one(label: str, method: str, url: str, extra: dict[str, str]) -> dict:
 
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with urllib.request.urlopen(req, timeout=PER_REQUEST_TIMEOUT) as r:
             body = r.read(512)
             result.update({
                 "status": r.status,
@@ -99,7 +100,24 @@ def probe_one(label: str, method: str, url: str, extra: dict[str, str]) -> dict:
     return result
 
 
-class handler(BaseHTTPRequestHandler):  # noqa: N801  (Vercel expects lowercase)
+def run_all(targets):
+    out = [None] * len(targets)
+    with ThreadPoolExecutor(max_workers=len(targets)) as pool:
+        futs = {pool.submit(probe_one, *t): i for i, t in enumerate(targets)}
+        for f in as_completed(futs, timeout=PER_REQUEST_TIMEOUT + 2):
+            try:
+                out[futs[f]] = f.result()
+            except Exception as e:
+                i = futs[f]
+                out[i] = {"label": targets[i][0], "url": targets[i][2], "error": f"future: {e}"}
+    # fill blanks for any that somehow didn't complete
+    for i, r in enumerate(out):
+        if r is None:
+            out[i] = {"label": targets[i][0], "url": targets[i][2], "error": "timeout_in_pool"}
+    return out
+
+
+class handler(BaseHTTPRequestHandler):  # noqa: N801
     def do_GET(self):  # noqa: N802
         wanted = None
         if "?" in self.path:
@@ -111,17 +129,16 @@ class handler(BaseHTTPRequestHandler):  # noqa: N801  (Vercel expects lowercase)
 
         targets = TARGETS
         if wanted:
-            targets = [t for t in TARGETS if t[0] == wanted]
-            if not targets:
-                targets = TARGETS  # unknown filter, run all
+            targets = [t for t in TARGETS if t[0] == wanted] or TARGETS
 
         started = time.time()
-        results = [probe_one(*t) for t in targets]
+        results = run_all(targets)
 
         out = {
             "region": os.environ.get("VERCEL_REGION") or os.environ.get("AWS_REGION"),
             "deployment": os.environ.get("VERCEL_DEPLOYMENT_ID"),
             "total_ms": int((time.time() - started) * 1000),
+            "per_request_timeout_s": PER_REQUEST_TIMEOUT,
             "results": results,
         }
         body = json.dumps(out, indent=2).encode()
