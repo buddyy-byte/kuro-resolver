@@ -30,7 +30,25 @@ TARGETS: list[tuple[str, str, str, dict[str, str]]] = [
 ]
 
 PER_REQUEST_TIMEOUT = 6.0
-IMPERSONATE = "chrome131"
+# Try chrome131 first, fall back to chrome124 if the installed curl_cffi is
+# too old to know about it. Both are modern enough to pass CF's JA3 checks.
+IMPERSONATE_CANDIDATES = ("chrome131", "chrome124", "chrome120")
+
+
+def _pick_impersonate() -> str:
+    for candidate in IMPERSONATE_CANDIDATES:
+        try:
+            cr.get("https://api.github.com/zen", impersonate=candidate, timeout=3)
+            return candidate
+        except Exception as e:
+            if "not supported" in str(e).lower():
+                continue
+            # Network error — the impersonate itself is fine, just move on
+            return candidate
+    return IMPERSONATE_CANDIDATES[-1]
+
+
+IMPERSONATE = _pick_impersonate()
 
 
 def probe_one(label: str, method: str, url: str, extra: dict[str, str]) -> dict:
