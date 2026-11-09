@@ -1,2 +1,1 @@
-# Intentionally empty for the probe deploy — probe.py uses stdlib only.
-# Stage 2 adds: httpx, curl_cffi (TLS impersonation for Cloudflare-fronted hosts).
+curl_cffi==0.7.3
