@@ -1,0 +1,22 @@
+{
+  "version": 2,
+  "functions": {
+    "api/probe.py": {
+      "runtime": "@vercel/python@4.3.1",
+      "maxDuration": 30
+    }
+  },
+  "rewrites": [
+    { "source": "/probe", "destination": "/api/probe" },
+    { "source": "/probe/(.*)", "destination": "/api/probe?target=$1" }
+  ],
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        { "key": "access-control-allow-origin", "value": "*" },
+        { "key": "cache-control", "value": "no-store" }
+      ]
+    }
+  ]
+}
