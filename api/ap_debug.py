@@ -25,9 +25,11 @@ class handler(BaseHTTPRequestHandler):  # noqa: N801
             qs = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
         q = qs.get("q", "one piece")
         impersonate = qs.get("impersonate") or animepahe.impersonate()
+        host = qs.get("host") or "animepahe.pw"
 
-        url = f"{animepahe.BASE}/api?m=search&q={quote(q)}"
+        url = f"https://{host}/api?m=search&q={quote(q)}"
         headers = dict(animepahe._HEADERS)  # type: ignore[attr-defined]
+        headers["referer"] = f"https://{host}/"
 
         try:
             r = cr.get(url, headers=headers, impersonate=impersonate, timeout=10, allow_redirects=True)
