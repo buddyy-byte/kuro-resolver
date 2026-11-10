@@ -26,6 +26,11 @@ _HEADERS = {
     "accept": "application/json, text/plain, */*",
     "accept-language": "en-US,en;q=0.9",
     "referer": BASE + "/",
+    # Animepahe's /api gate: without X-Requested-With it serves the HTML homepage
+    # instead of a JSON body. __ddg2_ primes DDoS-Guard so the first request isn't
+    # bounced to a challenge; any non-empty value is accepted.
+    "x-requested-with": "XMLHttpRequest",
+    "cookie": "__ddg2_=1;",
 }
 
 
