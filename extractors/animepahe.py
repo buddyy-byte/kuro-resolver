@@ -1,41 +1,44 @@
 """Animepahe client — search, release list, play page scraping.
 
-All requests go through curl_cffi with Chrome TLS impersonation. Animepahe
-sits behind DDoS-Guard (not Cloudflare) and accepted our naive urllib probe
-with a 200, so impersonation here is belt-and-suspenders.
+All HTTP goes through ``_fetch()`` which:
+  1. Fires the request through curl_cffi with Chrome TLS impersonation.
+  2. On a CF challenge response, hands off to ``cf_bypass.get_cookies()`` to
+     launch Camoufox, solve the challenge, cache the cookies, then retries once.
 
-Reference: the play page uses button rows like
+Target host rotates (animepahe.ru → animepahe.pw currently); ``BASE`` is pulled
+from env with a sane default so we can point at a new host via Render env vars
+without redeploying code.
 
-    <button data-src="https://kwik.si/e/ABC" data-audio="jpn"
-            data-resolution="1080" data-fansub="EVA">1080p</button>
-
-We harvest every button, let the caller sort by preferred audio/resolution,
-then hand the chosen kwik embed URL to extractors.kwik for unpacking.
+Animepahe's /api gate requires ``X-Requested-With: XMLHttpRequest`` + a
+``__ddg2_`` cookie primer or it returns the HTML homepage with 200 instead of
+the JSON body — that cost us a session earlier, hence the explicit headers.
 """
 from __future__ import annotations
 
+import os
 import re
 from urllib.parse import quote
 
 from curl_cffi import requests as cr
 
-BASE = "https://animepahe.ru"
+from extractors import cf_bypass
+
+BASE = os.environ.get("ANIMEPAHE_BASE", "https://animepahe.pw").rstrip("/")
+HOST = BASE.split("//", 1)[-1]
+
 IMPERSONATE_CANDIDATES = ("chrome131", "chrome124", "chrome120")
 
 _HEADERS = {
     "accept": "application/json, text/plain, */*",
     "accept-language": "en-US,en;q=0.9",
     "referer": BASE + "/",
-    # Animepahe's /api gate: without X-Requested-With it serves the HTML homepage
-    # instead of a JSON body. __ddg2_ primes DDoS-Guard so the first request isn't
-    # bounced to a challenge; any non-empty value is accepted.
     "x-requested-with": "XMLHttpRequest",
+    # Primer only; real __ddg2_ gets set via the CF bypass flow when it kicks in.
     "cookie": "__ddg2_=1;",
 }
 
 
 def _impersonate() -> str:
-    """Pick the newest Chrome impersonation profile the installed curl_cffi knows."""
     for candidate in IMPERSONATE_CANDIDATES:
         try:
             cr.get("https://api.github.com/zen", impersonate=candidate, timeout=3)
@@ -57,42 +60,54 @@ def impersonate() -> str:
     return _IMPERSONATE
 
 
-def _get(url: str, timeout: int = 8):
-    return cr.get(url, headers=_HEADERS, impersonate=impersonate(), timeout=timeout)
+def _merged_cookie(extra: str) -> str:
+    """Combine the __ddg2_ primer with any cached CF cookies for the host."""
+    cached = cf_bypass.cached_cookies(HOST) or {}
+    return cf_bypass.format_cookie_header(cached, extra=extra)
+
+
+def _fetch(url: str, timeout: int = 12, override_accept: str | None = None):
+    """GET with automatic CF-challenge retry via Camoufox cookie harvest."""
+    headers = dict(_HEADERS)
+    if override_accept:
+        headers["accept"] = override_accept
+    headers["cookie"] = _merged_cookie(_HEADERS["cookie"])
+
+    r = cr.get(url, headers=headers, impersonate=impersonate(), timeout=timeout, allow_redirects=True)
+
+    # Did we hit a CF interstitial? 403 is the common code but some configs use 503.
+    if r.status_code in (403, 429, 503) and cf_bypass.looks_like_challenge(r.content):
+        cf_bypass.get_cookies(HOST)  # populates the cache; may take 10-20s on first hit
+        headers["cookie"] = _merged_cookie(_HEADERS["cookie"])
+        r = cr.get(url, headers=headers, impersonate=impersonate(), timeout=timeout, allow_redirects=True)
+    return r
 
 
 def search(query: str) -> list[dict]:
-    """Return list of hits: {id, title, session, episodes, type, poster, score, ...}."""
-    r = _get(f"{BASE}/api?m=search&q={quote(query)}")
+    r = _fetch(f"{BASE}/api?m=search&q={quote(query)}")
     if r.status_code != 200:
         return []
     try:
-        data = r.json()
+        return (r.json() or {}).get("data") or []
     except Exception:
         return []
-    return data.get("data") or []
 
 
 def release(anime_session: str, page: int = 1) -> dict:
-    """Return the release-list page payload (total, per_page, last_page, data)."""
-    r = _get(f"{BASE}/api?m=release&id={anime_session}&sort=episode_asc&page={page}")
+    r = _fetch(f"{BASE}/api?m=release&id={anime_session}&sort=episode_asc&page={page}")
     if r.status_code != 200:
         return {"data": [], "last_page": 1}
     try:
-        return r.json()
+        return r.json() or {"data": [], "last_page": 1}
     except Exception:
         return {"data": [], "last_page": 1}
 
 
 def find_episode(anime_session: str, episode_number: float) -> dict | None:
-    """Walk release pages until we find the episode matching ``episode_number``.
-
-    Episode numbers can be floats (e.g. 7.5 for specials), so we compare with a
-    small epsilon rather than strict equality.
-    """
+    """Walk release pages for the episode with the matching number (floats OK)."""
     page = 1
     want = float(episode_number)
-    while page <= 50:  # hard cap; animepahe's longest series fit comfortably
+    while page <= 50:
         payload = release(anime_session, page=page)
         for ep in payload.get("data") or []:
             try:
@@ -107,8 +122,6 @@ def find_episode(anime_session: str, episode_number: float) -> dict | None:
     return None
 
 
-# Match animepahe play-page button rows. Buttons carry data-src (kwik embed),
-# data-audio (jpn/eng), data-resolution (360/720/1080), and data-fansub.
 _BUTTON_RE = re.compile(
     r'<button[^>]*?data-src="([^"]+)"[^>]*?data-audio="([^"]+)"[^>]*?data-resolution="([^"]+)"[^>]*?(?:data-fansub="([^"]*)")?',
     re.IGNORECASE | re.DOTALL,
@@ -118,11 +131,10 @@ _BUTTON_RE = re.compile(
 def play_sources(anime_session: str, episode_session: str) -> list[dict]:
     """Scrape the play page for every kwik embed candidate with metadata."""
     url = f"{BASE}/play/{anime_session}/{episode_session}"
-    headers = {**_HEADERS, "accept": "text/html,application/xhtml+xml,*/*"}
-    r = cr.get(url, headers=headers, impersonate=impersonate(), timeout=8)
+    r = _fetch(url, override_accept="text/html,application/xhtml+xml,*/*")
     if r.status_code != 200:
         return []
-    out = []
+    out: list[dict] = []
     for m in _BUTTON_RE.finditer(r.text):
         try:
             quality = int(m.group(3))
