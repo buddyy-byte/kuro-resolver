@@ -4,7 +4,8 @@
     { "source": "/probe", "destination": "/api/probe" },
     { "source": "/probe/:target", "destination": "/api/probe?target=:target" },
     { "source": "/probe-tls", "destination": "/api/probe_tls" },
-    { "source": "/probe-tls/:target", "destination": "/api/probe_tls?target=:target" }
+    { "source": "/probe-tls/:target", "destination": "/api/probe_tls?target=:target" },
+    { "source": "/play", "destination": "/api/play" }
   ],
   "headers": [
     {
